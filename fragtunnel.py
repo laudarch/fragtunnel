@@ -1,686 +1,265 @@
-import getopt
-import queue
+#!/usr/bin/env python3
+
+import sys
 import socket
 import threading
+import queue
 import time
-import sys
 import traceback
+import getopt
 
 BUFFER_SIZE = 8192
 FRAGMENT_SIZE = 1024
 
-SECRET_KEY = b""
-ENCRYPTED_TUNNEL = False
-VERBOSE = False
+CONFIG = {
+    "SECRET_KEY": b"",
+    "ENCRYPTED": False,
+    "VERBOSE": False,
+    "TARGET_SET": False,
+    "TARGET_IP": "",
+    "TARGET_PORT": 0,
+    "TUNNEL_IP": "",
+    "TUNNEL_PORT": 0,
+    "LOCAL_PORT": 0,
+    "BIND_IP": ""
+}
 
-TARGET_SET = False
-TUNNEL_SERVER_IN_BUFFER = queue.Queue()
-TUNNEL_SERVER_OUT_BUFFER = queue.Queue()
-TUNNEL_SERVER_IP, TUNNEL_SERVER_PORT, TARGET_IP, TARGET_PORT = str(""), int(0), str(""), int(0)
-LOCAL_PORT, BIND_IP = int(0), str("")
-CLIENT_TO_TARGET_SOCK = socket.socket
+SERVER_BUFFERS = {
+    "IN": queue.Queue(),
+    "OUT": queue.Queue(),
+    "CLIENT_SOCKET": None
+}
+
+def log(msg):
+    if CONFIG["VERBOSE"]:
+        print(msg)
+
+
+def xor_data(data: bytes, key: bytes) -> bytes:
+    extended_key = key * (len(data) // len(key)) + key[:len(data) % len(key)]
+    return bytes(a ^ b for a, b in zip(data, extended_key))
+
+
+def encrypt(data: bytes) -> bytes:
+    return xor_data(data, CONFIG["SECRET_KEY"]) if CONFIG["ENCRYPTED"] else data
+
+
+def decrypt(data: bytes) -> bytes:
+    return xor_data(data, CONFIG["SECRET_KEY"]) if CONFIG["ENCRYPTED"] else data
 
 
 class FragmentManager:
+    """Handles splitting and rejoining byte streams."""
+
     def __init__(self):
-        self.data = b''
-        self.fragmented_data = []
-        self.total_data_size = 0
-        self.fragmented_data_count = 0
-        self.fragmented_data_index = 0
+        self.fragments = []
+        self.index = 0
 
-    # create fragments from given data and store them in a list
-    def fragment_data(self, data):
-        if ENCRYPTED_TUNNEL is True:
-            self.data = encrypt_data(data)
-        else:
-            self.data = data
-        self.total_data_size = len(self.data)
-        self.fragmented_data_count = int(self.total_data_size / FRAGMENT_SIZE) + (
-                self.total_data_size % FRAGMENT_SIZE > 0)
+    def fragment(self, data: bytes):
+        payload = encrypt(data)
+        self.fragments = [payload[i:i+FRAGMENT_SIZE] for i in range(0, len(payload), FRAGMENT_SIZE)]
+        self.index = 0
 
-        for i in range(self.fragmented_data_count):
-            self.fragmented_data.append(self.data[i * FRAGMENT_SIZE:(i + 1) * FRAGMENT_SIZE])
+    def next(self):
+        if self.index < len(self.fragments):
+            frag = self.fragments[self.index]
+            self.index += 1
+            return frag
+        return None
 
-    # append a fragment to the list
-    def append_fragment(self, fragment):
-        self.fragmented_data.append(fragment)
+    def append(self, data: bytes):
+        self.fragments.append(data)
 
-    # get the next fragment from the list
-    def get_next_fragment(self):
-        if self.fragmented_data_index < self.fragmented_data_count:
-            self.fragmented_data_index += 1
-            return self.fragmented_data[self.fragmented_data_index - 1]
-        else:
-            return None
-
-    # get initial count of fragments we have (not updated)
-    def get_fragment_count(self):
-        return self.fragmented_data_count
-
-    # get the current count of fragments we have
-    def get_current_fragment_count(self):
-        return len(self.fragmented_data)
-
-    # get the fragment and remove (FIFO)
-    def get_fragment_and_remove(self):
-        return self.fragmented_data.pop(0)
-
-    # get the list of fragments
-    def get_fragmented_data(self):
-        return self.fragmented_data
-
-    def get_total_data_size(self):
-        return self.total_data_size
-
-    # join all fragments, decode/decrypt and return the data
-    def get_data(self):
-        if ENCRYPTED_TUNNEL is True:
-            return decrypt_data(b''.join(self.fragmented_data))
-        else:
-            return b''.join(self.fragmented_data)
+    def join(self) -> bytes:
+        return decrypt(b''.join(self.fragments))
 
     def clear(self):
-        time.sleep(0.1)
-        self.data = b''
-        self.fragmented_data = []
-        self.total_data_size = 0
-        self.fragmented_data_count = 0
-        self.fragmented_data_index = 0
+        self.fragments = []
+        self.index = 0
 
 
 class FragTunnel:
-    SPECIAL_EOD = str("###>EOD<###")
-    SPECIAL_ACK = str("###>ACK<###")
-    SPECIAL_ERR = str("###>ERR<###")
-    DATA = str("DATA")
-    TARGET_STRING = str("####>TARGETIP:PORT<####")
+    """Tunnel framing and special messages."""
 
-    # send special ACK to tunnel connection
+    EOD = b"###>EOD<###"
+    ACK = b"###>ACK<###"
+    ERR = b"###>ERR<###"
+    TARGET = b"####>TARGETIP:PORT<####"
+
     @staticmethod
-    def send_ack(s):
-        if ENCRYPTED_TUNNEL is True:
-            # send xor'ed special ACK to tunnel
-            s.sendall(encrypt_data(FragTunnel.SPECIAL_ACK.encode()))
-        else:
-            s.sendall(FragTunnel.SPECIAL_ACK.encode())
+    def send(s, msg: bytes):
+        s.sendall(encrypt(msg))
 
-    # send special EOD to tunnel connection
     @staticmethod
-    def send_eod(s):
-        if ENCRYPTED_TUNNEL is True:
-            # send xor'ed special EOD to tunnel
-            s.sendall(encrypt_data(FragTunnel.SPECIAL_EOD.encode()))
-        else:
-            s.sendall(FragTunnel.SPECIAL_EOD.encode())
+    def recv(s) -> dict:
+        raw = s.recv(FRAGMENT_SIZE)
+        if not raw:
+            return {"status": None, "data": None}
 
-    # send special ERR to tunnel connection
-    @staticmethod
-    def send_err(s):
-        if ENCRYPTED_TUNNEL is True:
-            # send xor'ed special ERR to tunnel
-            s.sendall(encrypt_data(FragTunnel.SPECIAL_ERR.encode()))
-        else:
-            s.sendall(FragTunnel.SPECIAL_ERR.encode())
-
-    # send a special message to set the target containing target ip and port
-    @staticmethod
-    def send_target_set_msg(s, target_ip, target_port):
-        set_target_text = FragTunnel.TARGET_STRING + target_ip + ":" + str(target_port)
-        if ENCRYPTED_TUNNEL is True:
-            result = s.sendall(encrypt_data(set_target_text.encode()))
-        else:
-            result = s.sendall(set_target_text.encode())
-        return result
-
-    # receive data from tunnel connection, decrypt if needed and return the status and raw data
-    @staticmethod
-    def recv_data(s):
-        data_obj = {"status": None, "raw_data": None}
-
-        data = s.recv(FRAGMENT_SIZE)
-        if not data:
-            return data_obj
-        else:
-            if ENCRYPTED_TUNNEL is True:
-                # xor data, get original content
-                decrypted_data = decrypt_data(data)
+        data = decrypt(raw)
+        try:
+            if data == FragTunnel.EOD:
+                return {"status": "EOD"}
+            elif data == FragTunnel.ACK:
+                return {"status": "ACK"}
+            elif data == FragTunnel.ERR:
+                return {"status": "ERR"}
+            elif data.startswith(FragTunnel.TARGET):
+                return {"status": "TARGET", "data": data}
             else:
-                decrypted_data = data
-            try:
-                if decrypted_data.decode() == FragTunnel.SPECIAL_EOD:
-                    data_obj["status"] = FragTunnel.SPECIAL_EOD
-                elif decrypted_data.decode() == FragTunnel.SPECIAL_ACK:
-                    data_obj["status"] = FragTunnel.SPECIAL_ACK
-                elif decrypted_data.decode() == FragTunnel.SPECIAL_ERR:
-                    data_obj["status"] = FragTunnel.SPECIAL_ERR
-                elif decrypted_data.decode()[:23] == FragTunnel.TARGET_STRING:
-                    data_obj["status"] = FragTunnel.TARGET_STRING
-                    data_obj["raw_data"] = decrypted_data
-                else:
-                    data_obj["status"] = FragTunnel.DATA
-                    data_obj["raw_data"] = data
-            except UnicodeDecodeError:
-                data_obj["status"] = FragTunnel.DATA
-                data_obj["raw_data"] = data
-
-            return data_obj
-
-    # join all fragments in the buffer, decrypt it if needed and return the data
-    @staticmethod
-    def join_fragments(fragments_buffer):
-        joined_data_list = []
-        while not fragments_buffer.empty():
-            joined_data_list.append(fragments_buffer.get())
-        joined_data = b''.join(joined_data_list)
-        if ENCRYPTED_TUNNEL is True:
-            # xor all joined data, get original and send to target
-            joined_data = decrypt_data(joined_data)
-        return joined_data
+                return {"status": "DATA", "data": raw}
+        except UnicodeDecodeError:
+            return {"status": "DATA", "data": raw}
 
 
-# a wrapper encrypt function to easily switch between xor and other encryption in the future
-def encrypt_data(data):
-    return xor_data(data, SECRET_KEY)
-
-
-# a wrapper decrypt function to easily switch between xor and other encryption in the future
-def decrypt_data(data):
-    return xor_data(data, SECRET_KEY)
-
-
-# xor byte data with a key
-def xor_data(original, key):
-    # Convert key to bytes if it's a string
-    key = key.encode() if isinstance(key, str) else key
-    # Extend the key to original string's length
-    extended_key = key * (len(original) // len(key)) + key[:len(original) % len(key)]
-    # XOR each byte of the original string with the corresponding byte in the extended key
-    xor_result = bytes(b1 ^ b2 for b1, b2 in zip(original, extended_key))
-    return xor_result
-
-
-# a function to check if the socket is connected
-def is_connected(sock):
-    try:
-        sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
-        return True
-    except socket.error:
-        return False
-
-
-# a function to print log messages if verbose mode is enabled
-def log(message):
-    if VERBOSE:
-        print(message)
-
-
-# a burnout, one time use, socket to send data, receive response, close and return a new socket
-def burnout_socket_sender(tunnel_client_socket, data, eod=False):
-    tunnel_client_socket.setblocking(1)
-    if eod is True:
-        FragTunnel.send_eod(tunnel_client_socket)
-        log("Sent EOD")
-    else:
-        tunnel_client_socket.sendall(data)
-        log("Sent data size: %d" % len(data))
-
-    response = FragTunnel.recv_data(tunnel_client_socket)
-
-    tunnel_client_socket.close()
-    tunnel_client_socket = None  # clear the socket
-    tunnel_client_socket = tunnel_client()
-
-    return tunnel_client_socket
-
-
-# a function to create fragments to be sent, send them one by one, finally send EOD and return a new socket
-def tunnel_client_fragmented_data_sender(tunnel_client_socket, data):
-    outgoing_fd_manager = FragmentManager()
-
-    # fragment data
-    outgoing_fd_manager.fragment_data(data)
-
-    # fragment by fragment send encrypted data leveraging burnout_socket_sender
-    for i in range(outgoing_fd_manager.get_fragment_count()):
-        log("Sending fragment %d" % i)
-        tunnel_client_socket = burnout_socket_sender(tunnel_client_socket, outgoing_fd_manager.get_next_fragment())
-
-    # finally send EOD
-    tunnel_client_socket = burnout_socket_sender(tunnel_client_socket, "", True)
-
-    outgoing_fd_manager.clear()
-    return tunnel_client_socket
-
-
-# a handler for local server and tunnel client couple
-def handle_local_client(local_connection, tunnel_client_socket):
-    try:
-        local_connection.setblocking(0)
-        tunnel_client_socket.setblocking(0)
-
-        # create a list of fragmented data
-        incoming_fd_manager = FragmentManager()
-
-        while True:
-            try:
-                local_data = local_connection.recv(BUFFER_SIZE)
-                if not local_data:
-                    break
-                else:
-                    # data received from local client will be fragmented and sent to tunnel.
-                    # Once all fragments are sent, we will send special EOD to tunnel.
-                    tunnel_client_socket = tunnel_client_fragmented_data_sender(tunnel_client_socket, local_data)
-
-            except BlockingIOError:
-                pass
-            except KeyboardInterrupt:
-                print("Server terminated by user")
-                return
-            except Exception as e:
-                print("Exception: %s" % str(e))
-                traceback.print_tb(e.__traceback__)
-                return
-
-            try:
-                tunnel_data = FragTunnel.recv_data(tunnel_client_socket)
-                if tunnel_data["status"] is None:
-                    break
-                else:
-                    tunnel_client_socket.setblocking(1)  # need to switch to blocking mode
-
-                    # try:
-                    if tunnel_data["status"] == FragTunnel.SPECIAL_EOD:
-                        # received EOD from tunnel, then join all fragments and send to local client
-                        local_connection.sendall(incoming_fd_manager.get_data())
-                        incoming_fd_manager.clear()
-                        FragTunnel.send_eod(tunnel_client_socket)
-
-                    # if received data, append to the list
-                    elif tunnel_data["status"] == FragTunnel.DATA:
-                        incoming_fd_manager.append_fragment(tunnel_data["raw_data"])
-
-                        # send special ACK to tunnel
-                        FragTunnel.send_ack(tunnel_client_socket)
-
-                    # now time to close tunnel socket and establish a new connection for next time use
-                    tunnel_client_socket.close()
-                    tunnel_client_socket = None  # clear the socket
-                    tunnel_client_socket = tunnel_client()
-
-            except BlockingIOError:
-                pass
-            except KeyboardInterrupt:
-                print("Server terminated by user")
-                return
-            except Exception as e:
-                print("Exception: %s" % str(e))
-                traceback.print_tb(e.__traceback__)
-                return
-
-    except KeyboardInterrupt:
-        print("Server terminated by user")
-        return
-    except Exception as e:
-        print("Exception: %s" % str(e))
-        traceback.print_tb(e.__traceback__)
-        return
-    finally:
-        # Close the connection
-        tunnel_client_socket.close()
-        local_connection.close()
-
-
-# local server to accept incoming connections from local apps and establish a tunnel client
 def local_server():
-    local_server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    local_server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-    # Bind the socket to the address and port
-    server_address = ('127.0.0.1', LOCAL_PORT)
-    local_server_socket.bind(server_address)
-
-    # Listen for incoming connections
-    local_server_socket.listen(5)
-    print("Local server listening on port %d" % LOCAL_PORT)
-
-    try:
+    """Handles local connections to the tunnel."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+        server.bind(('127.0.0.1', CONFIG["LOCAL_PORT"]))
+        server.listen(5)
+        log(f"[+] Local server listening on port {CONFIG['LOCAL_PORT']}")
         while True:
-            # Wait for a connection
-            local_connection, local_client_address = local_server_socket.accept()
-            log(f"Local connection from {local_client_address}")
-
-            tunnel_client_socket = tunnel_client()
-
-            # Create a thread to handle the client
-            client_thread = threading.Thread(target=handle_local_client, args=(local_connection, tunnel_client_socket,))
-            client_thread.daemon = True
-            client_thread.start()
-            client_thread.join()
-    except KeyboardInterrupt:
-        print("Local server terminated by user")
-        return
-    except Exception as e:
-        print("Exception: %s" % str(e))
-        traceback.print_tb(e.__traceback__)
-        return
+            conn, addr = server.accept()
+            log(f"[+] New local connection: {addr}")
+            tunnel = open_tunnel()
+            threading.Thread(target=handle_client, args=(conn, tunnel), daemon=True).start()
 
 
-# a function to create a client socket and connect to the target server then return the socket
-def local_client():
-    global TARGET_PORT, TARGET_IP
-    # Create a TCP/IP socket
-    local_client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-
-    # Connect the socket to the server address and port
-    server_address = (TARGET_IP, TARGET_PORT)
-    local_client_socket.connect(server_address)
-    log("Connected to target server")
-    local_client_socket.setblocking(0)
-    return local_client_socket
-
-
-# tunnel server handler to handle tunnel client connections and local client connections to target server
-def handle_tunnel_client(tunnel_connection):
-    global TUNNEL_SERVER_IN_BUFFER, TUNNEL_SERVER_OUT_BUFFER, CLIENT_TO_TARGET_SOCK, TARGET_SET
-    log("Handling new tunnel client connection")
-
+def handle_client(local_sock, tunnel_sock):
+    """Bidirectional transfer between local socket and tunnel."""
+    frag_mgr = FragmentManager()
     try:
-        # create a list of fragmented data
-        outgoing_fd_manager = FragmentManager()
+        local_sock.setblocking(False)
+        tunnel_sock.setblocking(False)
+
         while True:
             try:
-                if TUNNEL_SERVER_OUT_BUFFER.empty() is False:
-                    tunnel_connection.setblocking(1)
-                    while is_connected(tunnel_connection) is False:
-                        time.sleep(0.005)
-
-                    a = TUNNEL_SERVER_OUT_BUFFER.get()
-
-                    tunnel_connection.sendall(a)
-                    response = FragTunnel.recv_data(tunnel_connection)  # need to recv because of blocking
-
-                    # just a hack to make it work
-                    # some sleep delay is needed to prevent occasional partial data sent causing corrupted data
-                    time.sleep(0.02)
-            except BlockingIOError:
-                pass
-            except Exception as e:
-                print("Exception: %s" % str(e))
-                traceback.print_tb(e.__traceback__)
-
-            if is_connected(CLIENT_TO_TARGET_SOCK):
-                try:
-                    local_data = CLIENT_TO_TARGET_SOCK.recv(BUFFER_SIZE)
-                    if not local_data:
-                        break
-                    else:
-                        outgoing_fd_manager.fragment_data(local_data)
-
-                        # store into TUNNEL_SERVER_OUT_BUFFER to send it later fragment by fragment
-                        for i in range(outgoing_fd_manager.get_fragment_count()):
-                            b = outgoing_fd_manager.get_next_fragment()
-                            TUNNEL_SERVER_OUT_BUFFER.put(b)
-
-                        if ENCRYPTED_TUNNEL is True:
-                            # if encryption is enabled, send encrypted special EOD to tunnel
-                            TUNNEL_SERVER_OUT_BUFFER.put(encrypt_data(FragTunnel.SPECIAL_EOD.encode()))
-                        else:
-                            # send special EOD to tunnel
-                            TUNNEL_SERVER_OUT_BUFFER.put(FragTunnel.SPECIAL_EOD.encode())
-
-                        outgoing_fd_manager.clear()
-
-                except BlockingIOError:
-                    pass
-                except OSError as e:
-                    print(f"Error: %s" % e)
-                    return
-
-            if is_connected(tunnel_connection):
-                try:
-                    tunnel_connection.setblocking(0)
-                    tunnel_data = FragTunnel.recv_data(tunnel_connection)
-                    if tunnel_data["status"] is None:
-                        break
-                    else:
-                        # fragmented data received from the tunnel will be appended until EDO.
-                        # Once special EOD is received we will send the data to target server.
-                        if tunnel_data["status"] == FragTunnel.SPECIAL_EOD:
-                            joined_data = FragTunnel.join_fragments(TUNNEL_SERVER_IN_BUFFER)
-                            CLIENT_TO_TARGET_SOCK.sendall(joined_data)
-                            TUNNEL_SERVER_IN_BUFFER = queue.Queue()
-                            FragTunnel.send_eod(tunnel_connection)
-
-                        elif tunnel_data["status"] == FragTunnel.DATA:
-                            TUNNEL_SERVER_IN_BUFFER.put(tunnel_data["raw_data"])
-                            FragTunnel.send_ack(tunnel_connection)
-
-                        elif tunnel_data["status"] == FragTunnel.TARGET_STRING:
-                            if tunnel_set_target(tunnel_connection, tunnel_data) is False:
-                                break
-
-                except BlockingIOError:
-                    pass
-                except Exception as e:
-                    print("Exception: %s" % str(e))
-                    traceback.print_tb(e.__traceback__)
-
-    except KeyboardInterrupt:
-        print("Tunnel server terminated by user")
-    except Exception as e:
-        print("Exception: %s" % str(e))
-        traceback.print_tb(e.__traceback__)
-
-
-# a function to handle receiving target set message, set the target and send ACK
-def tunnel_set_target(tunnel_connection, tunnel_data=None):
-    global TARGET_SET, TARGET_IP, TARGET_PORT, CLIENT_TO_TARGET_SOCK
-
-    if tunnel_data is None:
-        tunnel_data = FragTunnel.recv_data(tunnel_connection)
-
-    if tunnel_data["status"] == FragTunnel.TARGET_STRING:
-        message = tunnel_data["raw_data"].decode()
-        log("Setting the target")
-
-        target_str = message[23:]
-        log("Received target ip %s and port %s" % (
-            target_str.split(":")[0], target_str.split(":")[1]))
-
-        TARGET_IP = target_str.split(":")[0]
-        TARGET_PORT = int(target_str.split(":")[1])
-        CLIENT_TO_TARGET_SOCK = local_client()
-        TARGET_SET = True
-        log("Target set")
-        FragTunnel.send_ack(tunnel_connection)
-        return True
-    else:
-        print("Error: Unexpected data received during setting target process")
-        print("\r\nCheck if both tunnel client and server are using encoding or not. "
-              "If they both using encoding with -e flag then make sure the secret is the same.")
-        FragTunnel.send_err(tunnel_connection)
-        return False
-
-
-# tunnel server to accept incoming connections from tunnel clients and establish a connection to target server
-def tunnel_server():
-    global TUNNEL_SERVER_PORT, TARGET_SET, TARGET_IP, TARGET_PORT, CLIENT_TO_TARGET_SOCK
-    # Create a TCP/IP socket
-    tunnel_server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    tunnel_server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-    # Bind the socket to the address and port
-    tunnel_server_address = ('0.0.0.0', TUNNEL_SERVER_PORT)
-    tunnel_server_socket.bind(tunnel_server_address)
-
-    # Listen for incoming connections
-    tunnel_server_socket.listen(5)
-    print("Tunnel server listening on port %d" % TUNNEL_SERVER_PORT)
-
-    try:
-        while True:
-            # Wait for a connection
-            tunnel_connection, tunnel_client_address = tunnel_server_socket.accept()
-            log(f"Tunnel client connection from {tunnel_client_address}")
-
-            if TARGET_SET is False:
-                if tunnel_set_target(tunnel_connection) is False:
+                data = local_sock.recv(BUFFER_SIZE)
+                if not data:
                     break
 
-            else:
-                # Create a thread to handle the client
-                client_thread = threading.Thread(target=handle_tunnel_client,
-                                                 args=(tunnel_connection,))
-                client_thread.daemon = True
-                client_thread.start()
-                client_thread.join()
-    except KeyboardInterrupt:
-        print("Tunnel server terminated by user")
-    except Exception as e:
-        print("Exception: %s" % str(e))
-        traceback.print_tb(e.__traceback__)
+                frag_mgr.fragment(data)
+                while (frag := frag_mgr.next()):
+                    FragTunnel.send(tunnel_sock, frag)
+                FragTunnel.send(tunnel_sock, FragTunnel.EOD)
+
+            except BlockingIOError:
+                pass
+
+            resp = FragTunnel.recv(tunnel_sock)
+            if resp["status"] == "DATA":
+                frag_mgr.append(resp["data"])
+                FragTunnel.send(tunnel_sock, FragTunnel.ACK)
+            elif resp["status"] == "EOD":
+                local_sock.sendall(frag_mgr.join())
+                frag_mgr.clear()
+                FragTunnel.send(tunnel_sock, FragTunnel.EOD)
+            elif resp["status"] is None:
+                break
+
     finally:
-        # Close the server socket
-        TARGET_SET = False
-        tunnel_server_socket.close()
+        local_sock.close()
+        tunnel_sock.close()
 
 
-# a function to create a tunnel client socket, send a message to set target and return the socket
-def tunnel_client():
-    global TUNNEL_SERVER_PORT, TUNNEL_SERVER_IP, TARGET_IP, TARGET_PORT, TARGET_SET
+def open_tunnel():
+    """Establish tunnel connection and optionally send target info."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.connect((CONFIG["TUNNEL_IP"], CONFIG["TUNNEL_PORT"]))
+    log("[+] Tunnel connection established.")
 
-    # Create a TCP/IP socket
-    tunnel_client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-
-    # Connect the socket to the server address and port
-    tunnel_server_address = (TUNNEL_SERVER_IP, TUNNEL_SERVER_PORT)
-    tunnel_client_socket.connect(tunnel_server_address)
-    log("Connected to tunnel server")
-
-    if TARGET_SET is False:
-        FragTunnel.send_target_set_msg(tunnel_client_socket, TARGET_IP, TARGET_PORT)
-
-        response = FragTunnel.recv_data(tunnel_client_socket)
-        if response["status"] == FragTunnel.SPECIAL_ACK:
-            log("Target server was set")
-            TARGET_SET = True
+    if not CONFIG["TARGET_SET"]:
+        FragTunnel.send(s, FragTunnel.TARGET + f"{CONFIG['TARGET_IP']}:{CONFIG['TARGET_PORT']}".encode())
+        ack = FragTunnel.recv(s)
+        if ack["status"] == "ACK":
+            CONFIG["TARGET_SET"] = True
         else:
-            log("Error: Setting target server failed")
+            FragTunnel.send(s, FragTunnel.ERR)
+            s.close()
+            raise RuntimeError("Failed to set target.")
+    return s
 
-        tunnel_client_socket.close()
-        return tunnel_client()
-    else:
-        tunnel_client_socket.setblocking(0)
-        return tunnel_client_socket
+
+def tunnel_server():
+    """Tunnel server that proxies tunnel clients to a single target."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+        server.bind((CONFIG["BIND_IP"], CONFIG["TUNNEL_PORT"]))
+        server.listen(5)
+        log(f"[+] Tunnel server listening on {CONFIG['BIND_IP']}:{CONFIG['TUNNEL_PORT']}")
+
+        while True:
+            conn, addr = server.accept()
+            log(f"[+] Tunnel client connected: {addr}")
+            threading.Thread(target=handle_tunnel_client, args=(conn,), daemon=True).start()
+
+
+def handle_tunnel_client(conn):
+    frag_mgr = FragmentManager()
+    try:
+        resp = FragTunnel.recv(conn)
+        if resp["status"] == "TARGET":
+            _, target = resp["data"].split(b":")
+            CONFIG["TARGET_IP"], CONFIG["TARGET_PORT"] = target.decode().split(":")
+            CONFIG["TARGET_PORT"] = int(CONFIG["TARGET_PORT"])
+            SERVER_BUFFERS["CLIENT_SOCKET"] = socket.create_connection((CONFIG["TARGET_IP"], CONFIG["TARGET_PORT"]))
+            FragTunnel.send(conn, FragTunnel.ACK)
+
+        client_sock = SERVER_BUFFERS["CLIENT_SOCKET"]
+
+        while True:
+            try:
+                inbound = client_sock.recv(BUFFER_SIZE)
+                if inbound:
+                    frag_mgr.fragment(inbound)
+                    while (frag := frag_mgr.next()):
+                        FragTunnel.send(conn, frag)
+                    FragTunnel.send(conn, FragTunnel.EOD)
+            except BlockingIOError:
+                pass
+
+            resp = FragTunnel.recv(conn)
+            if resp["status"] == "DATA":
+                frag_mgr.append(resp["data"])
+                FragTunnel.send(conn, FragTunnel.ACK)
+            elif resp["status"] == "EOD":
+                client_sock.sendall(frag_mgr.join())
+                frag_mgr.clear()
+                FragTunnel.send(conn, FragTunnel.EOD)
+
+    finally:
+        conn.close()
+        if SERVER_BUFFERS["CLIENT_SOCKET"]:
+            SERVER_BUFFERS["CLIENT_SOCKET"].close()
+
+
+def parse_args():
+    opts, _ = getopt.getopt(sys.argv[1:], "ht:T:p:b:e:v", ["help", "target=", "tunnelTo=", "port=", "bind=", "encrypt=", "verbose"])
+    for opt, val in opts:
+        if opt in ("-h", "--help"):
+            usage()
+        elif opt in ("-t", "--target"):
+            CONFIG["TARGET_IP"], CONFIG["TARGET_PORT"] = val.split(":")[0], int(val.split(":")[1])
+        elif opt in ("-T", "--tunnelTo"):
+            CONFIG["TUNNEL_IP"], CONFIG["TUNNEL_PORT"] = val.split(":")[0], int(val.split(":")[1])
+        elif opt in ("-p", "--port"):
+            CONFIG["LOCAL_PORT"] = int(val)
+        elif opt in ("-b", "--bind"):
+            CONFIG["BIND_IP"], CONFIG["TUNNEL_PORT"] = val.split(":")[0], int(val.split(":")[1])
+        elif opt in ("-e", "--encrypt"):
+            CONFIG["ENCRYPTED"] = True
+            CONFIG["SECRET_KEY"] = val.encode()
+        elif opt in ("-v", "--verbose"):
+            CONFIG["VERBOSE"] = True
 
 
 def usage():
-    print("\r\nUsage: %s -p port -t target ip:port -T tunnel endpoint ip:port -b bind ip:port -e secret\r\n" % \
-          sys.argv[0])
-    print("-h --help        help")
-    print("-p --port        port to listen for a local app to connect")
-    print("-t --target      target's ip:port")
-    print("-T --Tunnel to   tunnel server's ip:port")
-    print("-b --bind        tunnel server listen ip:port")
-    print("-e --encrypt     encrypt/encode tunnel traffic using the secret provided with this flag")
-    print("-v --verbose     verbose mode")
-
+    print(f"Usage: {sys.argv[0]} -p <local port> -t <target ip:port> -T <tunnel ip:port> -b <bind ip:port> -e <secret> -v")
     sys.exit(0)
 
 
 if __name__ == "__main__":
-    target, tunnel_endpoint, bind = str(""), str(""), str("")
-
-    if not len(sys.argv[1:]):
-        usage()
-        # read the commandline options
-
-    argumentList = sys.argv[1:]
-
-    # Options
-    options = "h:t:T:p:b:e:v"
-
-    # Long options
-    long_options = ["help", "target", "tunnelTo", "port=", "bind", "encrypt", "verbose"]
-
-    try:
-        arguments, values = getopt.getopt(argumentList, options, long_options)
-    except getopt.GetoptError as err:
-        print(str(err))
-        usage()
-        sys.exit(0)
-
-    # checking each argument
-    for currentArgument, currentValue in arguments:
-        if currentArgument in ("-h", "--help"):
-            usage()
-        elif currentArgument in ("-t", "--target"):
-            target = currentValue
-        elif currentArgument in ("-T", "--tunnelTo"):
-            tunnel_endpoint = currentValue
-        elif currentArgument in ("-p", "--port"):
-            LOCAL_PORT = int(currentValue)
-        elif currentArgument in ("-b", "--bind"):
-            bind = currentValue
-        elif currentArgument in ("-e", "--encrypt"):
-            ENCRYPTED_TUNNEL = True
-            SECRET_KEY = currentValue.encode()
-        elif currentArgument in ("-v", "--verbose"):
-            print("Verbose mode")
-            VERBOSE = True
-        else:
-            assert False, "Unhandled Option"
-
-    try:
-        if len(target) > 0:
-            target_list = target.split(":")
-            if not target_list[0]:
-                TARGET_IP = "127.0.0.1"
-            else:
-                TARGET_IP = target_list[0]
-            TARGET_PORT = int(target_list[1])
-        if len(tunnel_endpoint) > 0:
-            tunnel_endpoint_list = tunnel_endpoint.split(":")
-            if not tunnel_endpoint_list[0]:
-                TUNNEL_SERVER_IP = "127.0.0.1"
-            else:
-                TUNNEL_SERVER_IP = tunnel_endpoint_list[0]
-            TUNNEL_SERVER_PORT = int(tunnel_endpoint_list[1])
-        if len(bind) > 0:
-            bind_list = bind.split(":")
-            if not bind_list[0]:
-                BIND_IP = "0.0.0.0"
-            else:
-                BIND_IP = bind_list[0]
-            TUNNEL_SERVER_PORT = int(bind_list[1])
-            log("bind port is %d" % TUNNEL_SERVER_PORT)
-    except KeyboardInterrupt:
-        print("Exiting...")
-        sys.exit(0)
-    except Exception as e:
-        print("Exception: %s" % str(e))
-        traceback.print_tb(e.__traceback__)
-        sys.exit(0)
-
-    # tunnel client side
-    if LOCAL_PORT > 0 and len(tunnel_endpoint) > 0 and len(target) > 0:
-        if len(TUNNEL_SERVER_IP) > 0 and TUNNEL_SERVER_PORT > 0 and len(
-                TARGET_IP) > 0 and TARGET_PORT > 0:
-            local_server()
-
-    # tunnel server side
-    if len(BIND_IP) > 0 and TUNNEL_SERVER_PORT > 0:
-        try:
-            print("Binding fragmented server on %s:%d" % (BIND_IP, TUNNEL_SERVER_PORT))
-            tunnel_server()
-        except KeyboardInterrupt:
-            print("Exiting...")
-            sys.exit(0)
-
-    try:
-        # Wait for the threads to finish
-        while threading.active_count() > 1:
-            pass
-    except KeyboardInterrupt:
-        print("Exiting...")
+    parse_args()
+    if CONFIG["LOCAL_PORT"] and CONFIG["TUNNEL_IP"] and CONFIG["TARGET_IP"]:
+        local_server()
+    elif CONFIG["BIND_IP"]:
+        tunnel_server()
